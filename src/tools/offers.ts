@@ -59,7 +59,12 @@ const positionSchema = z
 const updatePositionSchema = positionSchema
   .extend({
     id: z.number().int().positive().optional().describe("Id of an existing position of this offer; omit to add a new position"),
-    positionNumber: z.number().int().min(0).optional().describe("Position number (0-based); defaults to the list index"),
+    positionNumber: z
+      .number()
+      .int()
+      .min(0)
+      .optional()
+      .describe("Position number (0-based); existing positions keep their number, new positions continue after the highest number"),
   })
   .strict();
 
@@ -214,7 +219,57 @@ export function assertTaxRates(taxRule: string, positions: ReadonlyArray<{ taxRa
   });
 }
 
-function toOrderPos(p: OfferPositionInput, index: number): Record<string, unknown> {
+/**
+ * Position numbers for update_offer. A position with an id keeps its current
+ * number; a new position continues after the highest number already in use.
+ * An explicit positionNumber from the caller always wins.
+ */
+function resolvePositionNumbers(submitted: ReadonlyArray<OfferPositionInput>, existing: ReadonlyArray<any>): number[] {
+  const currentById = new Map<number, number>();
+  for (const pos of existing) {
+    const n = Number(pos?.positionNumber);
+    if (pos?.positionNumber !== undefined && pos?.positionNumber !== null && pos?.positionNumber !== "" && Number.isInteger(n)) {
+      currentById.set(Number(pos.id), n);
+    }
+  }
+  let highest = Math.max(
+    -1,
+    ...currentById.values(),
+    ...submitted.filter((p) => p.positionNumber !== undefined).map((p) => p.positionNumber as number)
+  );
+  return submitted.map((p) => {
+    if (p.positionNumber !== undefined) return p.positionNumber;
+    if (p.id !== undefined && currentById.has(Number(p.id))) return currentById.get(Number(p.id)) as number;
+    highest += 1;
+    return highest;
+  });
+}
+
+/**
+ * On a taxRule change, every position the offer ends up with must fit the new
+ * rule. Submitted positions are checked by assertTaxRates; existing positions
+ * not in the submitted list keep their stored rate, so the tool refuses
+ * instead of rewriting them.
+ */
+function assertTaxRuleChange(
+  taxRule: OfferTaxRule,
+  submitted: ReadonlyArray<OfferPositionInput>,
+  existing: ReadonlyArray<any>
+): void {
+  const submittedIds = new Set(submitted.filter((p) => p.id !== undefined).map((p) => Number(p.id)));
+  const allowed: readonly number[] = OFFER_TAX_RULES[taxRule];
+  const mismatched = existing.filter((pos) => !submittedIds.has(Number(pos?.id)) && !allowed.includes(Number(pos?.taxRate)));
+  if (mismatched.length > 0) {
+    const list = mismatched
+      .map((pos) => `id ${pos.id}${pos.name ? ` '${pos.name}'` : ""} (taxRate ${pos.taxRate})`)
+      .join(", ");
+    throw new Error(
+      `Cannot change taxRule to ${taxRule}: existing position(s) ${list} have a taxRate that is not allowed for taxRule ${taxRule} (allowed: ${allowed.join(", ")}). Resubmit those positions with their id and an allowed taxRate in the same call.`
+    );
+  }
+}
+
+function toOrderPos(p: OfferPositionInput, positionNumber: number): Record<string, unknown> {
   const pos: Record<string, unknown> = {
     objectName: "OrderPos",
     mapAll: true,
@@ -224,7 +279,7 @@ function toOrderPos(p: OfferPositionInput, index: number): Record<string, unknow
     name: p.name,
     text: p.text ?? "",
     unity: { id: p.unityId, objectName: "Unity" },
-    positionNumber: p.positionNumber ?? index,
+    positionNumber,
     discount: 0,
     optional: false,
     taxRate: p.taxRate,
@@ -390,20 +445,28 @@ export const offerTools = {
       }
 
       const effectiveTaxRule = params.taxRule ?? String(current.taxRule?.id);
+      let positionNumbers: number[] = [];
       if (params.positions) {
         assertPositions(params.positions);
         assertTaxRates(effectiveTaxRule, params.positions);
-        const idsToChange = params.positions.filter((p) => p.id !== undefined).map((p) => Number(p.id));
-        if (idsToChange.length > 0) {
-          const existingIds = new Set((await loadPositions(client, orderId)).map((p) => Number(p.id)));
-          const foreign = idsToChange.filter((id) => !existingIds.has(id));
+      }
+      if (params.positions || params.taxRule !== undefined) {
+        const existing = await loadPositions(client, orderId);
+        if (params.positions) {
+          const existingIds = new Set(existing.map((p) => Number(p.id)));
+          const foreign = params.positions
+            .filter((p) => p.id !== undefined)
+            .map((p) => Number(p.id))
+            .filter((id) => !existingIds.has(id));
           if (foreign.length > 0) {
             throw new Error(`Position id(s) ${foreign.join(", ")} do not belong to offer ${orderId}`);
           }
+          positionNumbers = resolvePositionNumbers(params.positions, existing);
         }
-      } else if (params.taxRule !== undefined) {
-        // A rule change must still fit the positions already on the offer.
-        assertTaxRates(effectiveTaxRule, await loadPositions(client, orderId));
+        if (params.taxRule !== undefined) {
+          // The positions the offer ends up with must all fit the new rule.
+          assertTaxRuleChange(params.taxRule, params.positions ?? [], existing);
+        }
       }
 
       // Built field by field: status stays 100, orderType and orderNumber stay as they are.
@@ -435,7 +498,7 @@ export const offerTools = {
 
       return saveOrder(client, {
         order,
-        orderPosSave: params.positions ? params.positions.map((p, i) => toOrderPos(p, i)) : [],
+        orderPosSave: params.positions ? params.positions.map((p, i) => toOrderPos(p, positionNumbers[i])) : [],
         orderPosDelete: null,
       });
     },

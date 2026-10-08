@@ -143,6 +143,8 @@ SEVDESK_API_TOKEN="dein-token" npm start
   | `5` | Reverse Charge §13b UStG | 0 |
   | `11` | Steuer nicht erhoben §19 UStG | 0 |
 
+- Ändert `update_offer` die `taxRule`, müssen alle Positionen des Angebots zur neuen Regel passen. Bestehende Positionen mit unpassender `taxRate` lehnt das Tool ab, statt sie umzuschreiben; diese Positionen müssen mit ihrer `id` und einer erlaubten `taxRate` im selben Aufruf mitgeschickt werden.
+- `update_offer` behält die `positionNumber` bestehender Positionen bei. Neue Positionen werden nach der höchsten vorhandenen Nummer angehängt. Eine explizit übergebene `positionNumber` hat Vorrang.
 - Jede Position braucht eine Einheit (`unityId`, z. B. 1=Stk, 7=pauschal, 9=Std, 13=Tag(e)) und eine Menge größer 0. Ein Angebot braucht mindestens eine Position.
 
 ## API-Referenz

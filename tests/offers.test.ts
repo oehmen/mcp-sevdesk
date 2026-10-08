@@ -50,7 +50,7 @@ function draftOffer(overrides: Record<string, any> = {}) {
   };
 }
 
-function updateRoutes(offer: Record<string, any>, positions: any[] = [{ id: "555", taxRate: "0" }]) {
+function updateRoutes(offer: Record<string, any>, positions: any[] = [{ id: "555", taxRate: "0", positionNumber: "0" }]) {
   return {
     GET: {
       "/Order/{orderId}": { data: { objects: [offer] } },
@@ -486,6 +486,105 @@ describe("update_offer", () => {
     expect(orderPosSave[1]).not.toHaveProperty("id");
     expect(orderPosSave[1]).toMatchObject({ mapAll: true, unity: { id: 13, objectName: "Unity" }, positionNumber: 5 });
     expect(orderPosDelete).toBeNull();
+  });
+
+  describe("positionNumber", () => {
+    const threePositions = [
+      { id: "551", name: "Analyse", taxRate: "0", positionNumber: "0" },
+      { id: "552", name: "Umsetzung", taxRate: "0", positionNumber: "1" },
+      { id: "553", name: "Betrieb", taxRate: "0", positionNumber: "2" },
+    ];
+
+    it("sollte neue Positionen nach der höchsten bestehenden Nummer anhängen", async () => {
+      const { client, POST } = mockClient(updateRoutes(draftOffer(), threePositions));
+      await offerTools.update_offer.handler(client, {
+        orderId: 777,
+        positions: [
+          { name: "Workshop", quantity: 1, price: 2000, unityId: 13, taxRate: 0 },
+          { name: "Reise", quantity: 1, price: 300, unityId: 7, taxRate: 0 },
+        ],
+      });
+      const { orderPosSave } = POST.mock.calls[0][1].body;
+      expect(orderPosSave.map((p: any) => p.positionNumber)).toEqual([3, 4]);
+      orderPosSave.forEach((p: any) => expect(p).not.toHaveProperty("id"));
+    });
+
+    it("sollte die Nummer einer geänderten bestehenden Position beibehalten", async () => {
+      const { client, POST } = mockClient(updateRoutes(draftOffer(), threePositions));
+      await offerTools.update_offer.handler(client, {
+        orderId: 777,
+        positions: [{ id: 553, name: "Betrieb", quantity: 12, price: 900, unityId: 9, taxRate: 0 }],
+      });
+      const { orderPosSave } = POST.mock.calls[0][1].body;
+      expect(orderPosSave).toHaveLength(1);
+      expect(orderPosSave[0]).toMatchObject({ id: 553, positionNumber: 2, quantity: 12 });
+    });
+
+    it("sollte eine explizite positionNumber übernehmen und neue Positionen danach nummerieren", async () => {
+      const { client, POST } = mockClient(updateRoutes(draftOffer(), threePositions));
+      await offerTools.update_offer.handler(client, {
+        orderId: 777,
+        positions: [
+          { id: 551, name: "Analyse", quantity: 1, price: 500, unityId: 9, taxRate: 0, positionNumber: 7 },
+          { name: "Workshop", quantity: 1, price: 2000, unityId: 13, taxRate: 0 },
+        ],
+      });
+      const { orderPosSave } = POST.mock.calls[0][1].body;
+      expect(orderPosSave.map((p: any) => p.positionNumber)).toEqual([7, 8]);
+    });
+  });
+
+  it("sollte eine neue taxRule zusammen mit allen neu eingereichten Positionen speichern", async () => {
+    const existing = [
+      { id: "551", name: "Beratung", taxRate: "19", positionNumber: "0" },
+      { id: "552", name: "Workshop", taxRate: "19", positionNumber: "1" },
+    ];
+    const { client, POST } = mockClient(updateRoutes(draftOffer({ taxRule: { id: "1" } }), existing));
+    await offerTools.update_offer.handler(client, {
+      orderId: 777,
+      taxRule: "2",
+      taxText: "Steuerfrei - Ausfuhrlieferung",
+      positions: [
+        { id: 551, name: "Beratung", quantity: 2, price: 1500, unityId: 9, taxRate: 0 },
+        { id: 552, name: "Workshop", quantity: 1, price: 2000, unityId: 13, taxRate: 0 },
+        { name: "Reise", quantity: 1, price: 300, unityId: 7, taxRate: 0 },
+      ],
+    });
+    expect(POST).toHaveBeenCalledTimes(1);
+    const { order, orderPosSave } = POST.mock.calls[0][1].body;
+    expect(order.taxRule).toEqual({ id: "2", objectName: "TaxRule" });
+    expect(order.taxText).toBe("Steuerfrei - Ausfuhrlieferung");
+    expect(orderPosSave.map((p: any) => p.taxRate)).toEqual([0, 0, 0]);
+    expect(orderPosSave.map((p: any) => p.positionNumber)).toEqual([0, 1, 2]);
+  });
+
+  it("sollte eine neue taxRule ablehnen, wenn nicht eingereichte Positionen nicht passen", async () => {
+    const existing = [
+      { id: "551", name: "Beratung", taxRate: "19", positionNumber: "0" },
+      { id: "552", name: "Workshop", taxRate: "19", positionNumber: "1" },
+    ];
+    const { client, POST, PUT, DELETE } = mockClient(updateRoutes(draftOffer({ taxRule: { id: "1" } }), existing));
+    const error: Error = await offerTools.update_offer
+      .handler(client, {
+        orderId: 777,
+        taxRule: "2",
+        positions: [
+          { id: 552, name: "Workshop", quantity: 1, price: 2000, unityId: 13, taxRate: 0 },
+          { name: "Reise", quantity: 1, price: 300, unityId: 7, taxRate: 0 },
+        ],
+      })
+      .then(
+        () => {
+          throw new Error("expected update_offer to reject");
+        },
+        (e: Error) => e
+      );
+    expect(error.message).toMatch(/Cannot change taxRule to 2: existing position\(s\) id 551 'Beratung' \(taxRate 19\)/);
+    expect(error.message).toMatch(/Resubmit those positions/);
+    expect(error.message).not.toMatch(/id 552/);
+    expect(POST).not.toHaveBeenCalled();
+    expect(PUT).not.toHaveBeenCalled();
+    expect(DELETE).not.toHaveBeenCalled();
   });
 
   it("sollte fremde Positions-IDs ablehnen", async () => {
