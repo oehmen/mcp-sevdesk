@@ -34,7 +34,7 @@ const DRAFT_NOTE = "Draft (status 100). Review and send manually in sevDesk.";
 const DRAFT_ONLY_TEXT =
   "Draft only: creates/updates offers in status 100. Sending, status changes, conversion and deletion are not available and stay manual in sevDesk.";
 
-/** `/SevSequence/Factory/getByType` is not in the OpenAPI spec, so it needs an untyped call. */
+/** `/Order/Factory/getNextOrderNumber` is not in the OpenAPI spec, so it needs an untyped call. */
 type UntypedGet = (
   path: string,
   init?: { params?: { query?: Record<string, unknown> } }
@@ -142,29 +142,70 @@ export function todaySevdeskDate(now: Date = new Date()): string {
   return `${dd}.${mm}.${now.getFullYear()}`;
 }
 
-/** Fetches the next offer number from sevDesk and formats it (e.g. `AN-2026-1281`). Never invents a number. */
-export async function fetchNextOfferNumber(client: SevdeskClient, now: Date = new Date()): Promise<string> {
-  const { data, error } = await (client.GET as unknown as UntypedGet)("/SevSequence/Factory/getByType", {
-    params: { query: { objectType: "Order", type: "AN" } },
+/**
+ * sevDesk's offer counter. `SevSequence/Factory/getByType` only reads the
+ * counter and `saveOrder` with an explicit orderNumber does not advance it, so
+ * reading the counter there handed out the same number again and again. This
+ * endpoint reads (`useNextNumber=false`) or reserves (`useNextNumber=true`,
+ * advances the counter by one) the next number, formatted by sevDesk.
+ */
+export const NEXT_OFFER_NUMBER_PATH = "/Order/Factory/getNextOrderNumber";
+
+/**
+ * Returns the next offer number from sevDesk (e.g. `AN-2026-1283`). With
+ * `reserve` false the counter is left unchanged; with `reserve` true sevDesk
+ * advances it. `useNextNumber` is always sent explicitly, because the API
+ * default is `true` and a peek without it would consume a number.
+ * Never invents a number.
+ */
+export async function getNextOfferNumber(client: SevdeskClient, reserve: boolean): Promise<string> {
+  const { data, error } = await (client.GET as unknown as UntypedGet)(NEXT_OFFER_NUMBER_PATH, {
+    params: { query: { orderType: "AN", useNextNumber: reserve ? "true" : "false" } },
   });
   if (error) throw new Error(JSON.stringify(error));
-  const nextSequence = data?.objects?.nextSequence;
-  if (nextSequence === undefined || nextSequence === null || nextSequence === "") {
-    throw new Error("sevDesk did not return a next offer sequence number");
+  const value: unknown = data?.objects;
+  if (typeof value !== "string" || value.trim() === "") {
+    throw new Error("sevDesk did not return a next offer number");
   }
-  const year = String(now.getFullYear());
-  const format: unknown = data?.objects?.format;
-  if (typeof format !== "string" || format.length === 0) {
-    return `AN-${year}-${nextSequence}`;
+  const number = value.trim();
+  if (number.includes("%")) {
+    throw new Error(`Unsupported offer number '${number}' from sevDesk`);
   }
-  const formatted = format
-    .replace(/%YYYY/g, year)
-    .replace(/%YY/g, year.slice(-2))
-    .replace(/%NUMBER/g, String(nextSequence));
-  if (formatted.includes("%")) {
-    throw new Error(`Unsupported offer number format '${format}'`);
-  }
-  return formatted;
+  return number;
+}
+
+/**
+ * Finds every order with exactly this number: any orderType, any status, any
+ * contact. The server filter is matched again on the client so a loose filter
+ * cannot hide or invent a hit.
+ */
+export async function findOffersByNumber(
+  client: SevdeskClient,
+  orderNumber: string
+): Promise<Array<{ id: string; status: unknown; contactId: unknown }>> {
+  const { data, error } = await client.GET("/Order", {
+    params: { query: { orderNumber, limit: 100 } as any },
+  });
+  if (error) throw new Error(JSON.stringify(error));
+  const orders: any[] = ((data as any)?.objects ?? []) as any[];
+  return orders
+    .filter((o) => String(o?.orderNumber ?? "").trim() === orderNumber)
+    .map((o) => ({ id: String(o.id), status: o.status, contactId: o.contact?.id }));
+}
+
+/**
+ * Refuses a number that is already in use. There is no automatic skip to the
+ * next free number: a hit means sevDesk's counter is out of step with the
+ * existing offers, a person should see that, and skipping would repeat a
+ * counter-advancing call whose behaviour cannot be tested without writes.
+ */
+async function assertOfferNumberFree(client: SevdeskClient, orderNumber: string, reserved: boolean): Promise<void> {
+  const hits = await findOffersByNumber(client, orderNumber);
+  if (hits.length === 0) return;
+  const ids = hits.map((h) => h.id);
+  throw new Error(
+    `Offer number ${orderNumber} already exists (offer id(s) ${ids.join(", ")}). No offer was created. sevDesk's offer counter is out of step with the existing offers${reserved ? " and has already moved past this number" : ""}. Set the next offer number (Nummernkreis for Angebote) in the sevDesk settings above the highest AN number in use, then try again.`
+  );
 }
 
 /** Loads an order and asserts it is an offer (orderType "AN"). */
@@ -382,7 +423,7 @@ export const offerTools = {
   },
 
   create_offer: {
-    description: `Create a new offer (Angebot, orderType AN) in sevdesk. The offer number is fetched from sevDesk. ${DRAFT_ONLY_TEXT}`,
+    description: `Create a new offer (Angebot, orderType AN) in sevdesk. The offer number is reserved from sevDesk's offer counter; the tool refuses to create an offer when that number already exists on any order. ${DRAFT_ONLY_TEXT}`,
     inputSchema: createOfferSchema,
     handler: async (client: SevdeskClient, params: CreateOfferInput) => {
       // Guards run before any API call.
@@ -390,7 +431,13 @@ export const offerTools = {
       assertTaxRates(params.taxRule, params.positions);
       const contactPersonId = resolveContactPersonId(params.contactPersonId);
 
-      const orderNumber = await fetchNextOfferNumber(client);
+      // Peek, check, reserve, check again if sevDesk handed out a different
+      // number. A refusal on the peeked number has no side effect, and the
+      // number actually saved is always checked. Any error aborts before saveOrder.
+      const candidate = await getNextOfferNumber(client, false);
+      await assertOfferNumberFree(client, candidate, false);
+      const orderNumber = await getNextOfferNumber(client, true);
+      if (orderNumber !== candidate) await assertOfferNumberFree(client, orderNumber, true);
 
       // Built field by field: caller input can never set status, orderType or orderNumber.
       const order: Record<string, unknown> = {
