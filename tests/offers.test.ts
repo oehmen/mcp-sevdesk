@@ -8,19 +8,39 @@ import type { SevdeskClient } from "../src/client.js";
 // Fully mocked: these tests never call the sevDesk API.
 
 type Route = { data?: any; error?: any };
+/** A route is a fixed response or a function of the request init (peek and reserve share one path). */
+type RouteSpec = Route | ((init: any) => Route);
 
-function mockClient(routes: { GET?: Record<string, Route>; POST?: Record<string, Route> }) {
-  const GET = vi.fn(async (path: string, _init?: any) => routes.GET?.[path] ?? { error: { message: `unmocked GET ${path}` } });
-  const POST = vi.fn(async (path: string, _init?: any) => routes.POST?.[path] ?? { error: { message: `unmocked POST ${path}` } });
+function resolveRoute(spec: RouteSpec | undefined, init: any): Route | undefined {
+  return typeof spec === "function" ? spec(init) : spec;
+}
+
+function mockClient(routes: { GET?: Record<string, RouteSpec>; POST?: Record<string, RouteSpec> }) {
+  const GET = vi.fn(async (path: string, init?: any) => resolveRoute(routes.GET?.[path], init) ?? { error: { message: `unmocked GET ${path}` } });
+  const POST = vi.fn(async (path: string, init?: any) => resolveRoute(routes.POST?.[path], init) ?? { error: { message: `unmocked POST ${path}` } });
   const PUT = vi.fn();
   const DELETE = vi.fn();
   return { client: { GET, POST, PUT, DELETE } as unknown as SevdeskClient, GET, POST, PUT, DELETE };
 }
 
-const SEQUENCE_PATH = "/SevSequence/Factory/getByType";
+const NEXT_PATH = "/Order/Factory/getNextOrderNumber";
+const ORDER_LIST_PATH = "/Order";
 const SAVE_PATH = "/Order/Factory/saveOrder";
-const sequenceResponse: Route = { data: { objects: { nextSequence: 1281, format: "AN-%YYYY-%NUMBER" } } };
-const saveResponse: Route = { data: { objects: { order: { id: 999, orderNumber: "AN-2026-1281", status: "100" }, orderPos: [{ id: 1 }] } } };
+const saveResponse: Route = { data: { objects: { order: { id: 999, orderNumber: "AN-2026-1283", status: "100" }, orderPos: [{ id: 1 }] } } };
+
+/** Next-number route: peek (`useNextNumber: "false"`) and reserve (`"true"`) responses. */
+function nextNumberRoute(peek: Route, reserve: Route = peek): RouteSpec {
+  return (init: any) => (init?.params?.query?.useNextNumber === "true" ? reserve : peek);
+}
+
+/** Order-list route: existing orders per orderNumber filter. */
+function orderListRoute(byNumber: Record<string, any[]> = {}): RouteSpec {
+  return (init: any) => ({ data: { objects: byNumber[init?.params?.query?.orderNumber] ?? [] } });
+}
+
+function isReserveCall(call: any[]): boolean {
+  return call[0] === NEXT_PATH && call[1]?.params?.query?.useNextNumber === "true";
+}
 
 const validCreate = {
   contactId: 123,
@@ -31,9 +51,12 @@ const validCreate = {
   positions: [{ name: "Beratung", quantity: 2, price: 1500, unityId: 9, taxRate: 0 }],
 };
 
-function createRoutes() {
+function createRoutes(): { GET: Record<string, RouteSpec>; POST: Record<string, RouteSpec> } {
   return {
-    GET: { [SEQUENCE_PATH]: sequenceResponse },
+    GET: {
+      [NEXT_PATH]: nextNumberRoute({ data: { objects: "AN-2026-1283" } }),
+      [ORDER_LIST_PATH]: orderListRoute(),
+    },
     POST: { [SAVE_PATH]: saveResponse },
   };
 }
@@ -158,18 +181,32 @@ describe("Offers: Draft-only-Garantie", () => {
 });
 
 describe("create_offer", () => {
-  it("sollte einen Entwurf mit abgerufener Angebotsnummer anlegen", async () => {
+  it("sollte einen Entwurf mit reservierter Angebotsnummer anlegen (Peek, Prüfung, Reservierung, Speichern)", async () => {
     const { client, GET, POST, PUT, DELETE } = mockClient(createRoutes());
     const result = await offerTools.create_offer.handler(client, validCreate);
 
-    expect(GET).toHaveBeenCalledWith(SEQUENCE_PATH, { params: { query: { objectType: "Order", type: "AN" } } });
+    // Exact call order: peek -> duplicate guard -> reserve -> saveOrder.
+    expect(GET).toHaveBeenCalledTimes(3);
+    expect(GET.mock.calls[0]).toEqual([NEXT_PATH, { params: { query: { orderType: "AN", useNextNumber: "false" } } }]);
+    expect(GET.mock.calls[1][0]).toBe(ORDER_LIST_PATH);
+    const guardQuery = GET.mock.calls[1][1].params.query;
+    expect(guardQuery).toEqual({ orderNumber: "AN-2026-1283", limit: 100 });
+    for (const key of ["orderType", "status", "contact[id]", "contact[objectName]"]) {
+      expect(guardQuery).not.toHaveProperty(key);
+    }
+    expect(GET.mock.calls[2]).toEqual([NEXT_PATH, { params: { query: { orderType: "AN", useNextNumber: "true" } } }]);
     expect(POST).toHaveBeenCalledTimes(1);
+    const lastGetOrder = Math.max(...GET.mock.invocationCallOrder);
+    expect(POST.mock.invocationCallOrder[0]).toBeGreaterThan(lastGetOrder);
+    expect(GET.mock.invocationCallOrder[0]).toBeLessThan(GET.mock.invocationCallOrder[1]);
+    expect(GET.mock.invocationCallOrder[1]).toBeLessThan(GET.mock.invocationCallOrder[2]);
+
     const [path, init] = POST.mock.calls[0];
     expect(path).toBe(SAVE_PATH);
     const { order, orderPosSave, orderPosDelete } = init.body;
 
     expect(order.id).toBeNull();
-    expect(order.orderNumber).toBe("AN-2026-1281");
+    expect(order.orderNumber).toBe("AN-2026-1283");
     expect(order.status).toBe(100);
     expect(order.orderType).toBe("AN");
     expect(order.mapAll).toBe(true);
@@ -212,40 +249,135 @@ describe("create_offer", () => {
     } as any);
     const { order } = POST.mock.calls[0][1].body;
     expect(order.status).toBe(100);
-    expect(order.orderNumber).toBe("AN-2026-1281");
+    expect(order.orderNumber).toBe("AN-2026-1283");
     expect(order.orderType).toBe("AN");
   });
 
-  it("sollte ohne format AN-YYYY-<Nummer> bilden", async () => {
-    const routes = createRoutes();
-    routes.GET[SEQUENCE_PATH] = { data: { objects: { nextSequence: 1281 } } };
-    const { client, POST } = mockClient(routes);
-    await offerTools.create_offer.handler(client, validCreate);
-    expect(POST.mock.calls[0][1].body.order.orderNumber).toBe("AN-2026-1281");
-  });
+  describe("Angebotsnummer und Duplikatschutz", () => {
+    it("sollte eine bereits vergebene Nummer ablehnen und nichts anlegen", async () => {
+      const routes = createRoutes();
+      routes.GET[NEXT_PATH] = nextNumberRoute({ data: { objects: "AN-2026-1281" } });
+      routes.GET[ORDER_LIST_PATH] = orderListRoute({
+        "AN-2026-1281": [
+          { id: "30234435", orderNumber: "AN-2026-1281", status: "500", contact: { id: "137644298" } },
+          { id: "28275368", orderNumber: "AN-2026-1281", status: "100", contact: { id: "131897733" } },
+        ],
+      });
+      const { client, GET, POST, PUT, DELETE } = mockClient(routes);
+      const error: Error = await offerTools.create_offer.handler(client, validCreate).then(
+        () => {
+          throw new Error("expected create_offer to reject");
+        },
+        (e: Error) => e
+      );
+      expect(error.message).toContain("AN-2026-1281");
+      expect(error.message).toContain("30234435");
+      expect(error.message).toContain("28275368");
+      expect(error.message).toContain("No offer was created");
+      expect(error.message).not.toContain("already moved past");
+      expect(GET.mock.calls.some(isReserveCall)).toBe(false);
+      expect(POST).not.toHaveBeenCalled();
+      expect(PUT).not.toHaveBeenCalled();
+      expect(DELETE).not.toHaveBeenCalled();
+    });
 
-  it("sollte bei einem SevSequence-Fehler abbrechen, ohne zu speichern", async () => {
-    const routes = createRoutes();
-    routes.GET[SEQUENCE_PATH] = { error: { message: "boom" } };
-    const { client, POST } = mockClient(routes);
-    await expect(offerTools.create_offer.handler(client, validCreate)).rejects.toThrow("boom");
-    expect(POST).not.toHaveBeenCalled();
-  });
+    it("sollte eine freie Nummer anlegen, auch wenn dieselbe Laufnummer in einem anderen Jahr existiert", async () => {
+      const routes = createRoutes();
+      routes.GET[NEXT_PATH] = nextNumberRoute({ data: { objects: "AN-2026-1281" } });
+      routes.GET[ORDER_LIST_PATH] = () => ({ data: { objects: [{ id: "21173457", orderNumber: "AN-2025-1281", status: "500" }] } });
+      const { client, POST } = mockClient(routes);
+      await offerTools.create_offer.handler(client, validCreate);
+      expect(POST).toHaveBeenCalledTimes(1);
+      expect(POST.mock.calls[0][1].body.order.orderNumber).toBe("AN-2026-1281");
+      expect(POST.mock.calls[0][1].body.order.status).toBe(100);
+    });
 
-  it("sollte ohne nextSequence abbrechen, statt eine Nummer zu erfinden", async () => {
-    const routes = createRoutes();
-    routes.GET[SEQUENCE_PATH] = { data: { objects: { format: "AN-%YYYY-%NUMBER" } } };
-    const { client, POST } = mockClient(routes);
-    await expect(offerTools.create_offer.handler(client, validCreate)).rejects.toThrow(/sequence/);
-    expect(POST).not.toHaveBeenCalled();
-  });
+    it("sollte eine abweichende reservierte Nummer erneut prüfen und speichern", async () => {
+      const routes = createRoutes();
+      routes.GET[NEXT_PATH] = nextNumberRoute({ data: { objects: "AN-2026-1283" } }, { data: { objects: "AN-2026-1284" } });
+      const { client, GET, POST } = mockClient(routes);
+      await offerTools.create_offer.handler(client, validCreate);
+      expect(GET).toHaveBeenCalledTimes(4);
+      expect(GET.mock.calls[3][0]).toBe(ORDER_LIST_PATH);
+      expect(GET.mock.calls[3][1].params.query).toEqual({ orderNumber: "AN-2026-1284", limit: 100 });
+      expect(POST.mock.invocationCallOrder[0]).toBeGreaterThan(GET.mock.invocationCallOrder[3]);
+      expect(POST.mock.calls[0][1].body.order.orderNumber).toBe("AN-2026-1284");
+    });
 
-  it("sollte bei unbekannten Platzhaltern im format abbrechen", async () => {
-    const routes = createRoutes();
-    routes.GET[SEQUENCE_PATH] = { data: { objects: { nextSequence: 5, format: "AN-%MM-%NUMBER" } } };
-    const { client, POST } = mockClient(routes);
-    await expect(offerTools.create_offer.handler(client, validCreate)).rejects.toThrow(/format/);
-    expect(POST).not.toHaveBeenCalled();
+    it("sollte eine abweichende reservierte Nummer ablehnen, wenn sie bereits vergeben ist", async () => {
+      const routes = createRoutes();
+      routes.GET[NEXT_PATH] = nextNumberRoute({ data: { objects: "AN-2026-1283" } }, { data: { objects: "AN-2026-1284" } });
+      routes.GET[ORDER_LIST_PATH] = orderListRoute({
+        "AN-2026-1284": [{ id: "40000001", orderNumber: "AN-2026-1284", status: "200", contact: { id: "1" } }],
+      });
+      const { client, POST, PUT, DELETE } = mockClient(routes);
+      const error: Error = await offerTools.create_offer.handler(client, validCreate).then(
+        () => {
+          throw new Error("expected create_offer to reject");
+        },
+        (e: Error) => e
+      );
+      expect(error.message).toContain("AN-2026-1284");
+      expect(error.message).toContain("40000001");
+      expect(error.message).toContain("already moved past");
+      expect(POST).not.toHaveBeenCalled();
+      expect(PUT).not.toHaveBeenCalled();
+      expect(DELETE).not.toHaveBeenCalled();
+    });
+
+    it("sollte bei einem Fehler beim Lesen der nächsten Nummer abbrechen, ohne zu speichern", async () => {
+      const routes = createRoutes();
+      routes.GET[NEXT_PATH] = nextNumberRoute({ error: { message: "boom" } });
+      const { client, GET, POST } = mockClient(routes);
+      await expect(offerTools.create_offer.handler(client, validCreate)).rejects.toThrow("boom");
+      expect(GET.mock.calls.some(isReserveCall)).toBe(false);
+      expect(POST).not.toHaveBeenCalled();
+    });
+
+    it("sollte bei einem Fehler der Duplikatprüfung abbrechen, ohne zu reservieren oder zu speichern", async () => {
+      const routes = createRoutes();
+      routes.GET[ORDER_LIST_PATH] = { error: { message: "list failed" } };
+      const { client, GET, POST } = mockClient(routes);
+      await expect(offerTools.create_offer.handler(client, validCreate)).rejects.toThrow("list failed");
+      expect(GET.mock.calls.some(isReserveCall)).toBe(false);
+      expect(POST).not.toHaveBeenCalled();
+    });
+
+    it("sollte bei einem Fehler beim Reservieren abbrechen, ohne zu speichern", async () => {
+      const routes = createRoutes();
+      routes.GET[NEXT_PATH] = nextNumberRoute({ data: { objects: "AN-2026-1283" } }, { error: { message: "reserve failed" } });
+      const { client, POST } = mockClient(routes);
+      await expect(offerTools.create_offer.handler(client, validCreate)).rejects.toThrow("reserve failed");
+      expect(POST).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ["fehlendes objects", {}, /did not return/],
+      ["leerer String", { objects: "" }, /did not return/],
+      ["Zahl statt String", { objects: 1283 }, /did not return/],
+      ["unaufgelöster Platzhalter", { objects: "AN-%YYYY-1" }, /Unsupported offer number/],
+    ])("sollte bei %s abbrechen, statt eine Nummer zu erfinden", async (_label, data, message) => {
+      const routes = createRoutes();
+      routes.GET[NEXT_PATH] = nextNumberRoute({ data });
+      const { client, GET, POST } = mockClient(routes);
+      await expect(offerTools.create_offer.handler(client, validCreate)).rejects.toThrow(message);
+      expect(GET.mock.calls.some(isReserveCall)).toBe(false);
+      expect(POST).not.toHaveBeenCalled();
+    });
+
+    it("sollte eine ungültige reservierte Nummer ablehnen, ohne zu speichern", async () => {
+      const routes = createRoutes();
+      routes.GET[NEXT_PATH] = nextNumberRoute({ data: { objects: "AN-2026-1283" } }, { data: { objects: "" } });
+      const { client, POST } = mockClient(routes);
+      await expect(offerTools.create_offer.handler(client, validCreate)).rejects.toThrow(/did not return/);
+      expect(POST).not.toHaveBeenCalled();
+    });
+
+    it("sollte höchstens einmal pro Aufruf reservieren", async () => {
+      const { client, GET } = mockClient(createRoutes());
+      await offerTools.create_offer.handler(client, validCreate);
+      expect(GET.mock.calls.filter(isReserveCall)).toHaveLength(1);
+    });
   });
 
   it("sollte Inlandsangebote mit 19 % und 7 % akzeptieren", async () => {
@@ -433,7 +565,7 @@ describe("update_offer", () => {
   });
 
   it("sollte Kopfdaten eines Entwurfs ändern und Status 100 beibehalten", async () => {
-    const { client, POST, PUT, DELETE } = mockClient(updateRoutes(draftOffer()));
+    const { client, GET, POST, PUT, DELETE } = mockClient(updateRoutes(draftOffer()));
     const result = await offerTools.update_offer.handler(client, { orderId: 777, headText: "neu", orderDate: "2026-10-09" });
     const [path, init] = POST.mock.calls[0];
     expect(path).toBe(SAVE_PATH);
@@ -453,6 +585,8 @@ describe("update_offer", () => {
     expect(orderPosSave).toEqual([]);
     expect(orderPosDelete).toBeNull();
     expect(result.note).toContain("status 100");
+    // update_offer keeps the stored number and never reads or reserves a new one.
+    expect(GET.mock.calls.some((call) => call[0] === NEXT_PATH)).toBe(false);
     expect(PUT).not.toHaveBeenCalled();
     expect(DELETE).not.toHaveBeenCalled();
   });

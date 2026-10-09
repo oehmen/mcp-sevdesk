@@ -124,12 +124,13 @@ SEVDESK_API_TOKEN="dein-token" npm start
 |------|-------------|
 | `list_offers` | Angebote (orderType `AN`) auflisten, filterbar nach Kontakt, Status und Angebotsnummer |
 | `get_offer` | Einzelnes Angebot mit Positionen abrufen (lehnt Aufträge ab, die keine Angebote sind) |
-| `create_offer` | Neues Angebot als Entwurf (Status 100) anlegen |
+| `create_offer` | Neues Angebot als Entwurf (Status 100) mit reservierter, eindeutiger Angebotsnummer anlegen |
 | `update_offer` | Angebotsentwurf (Status 100) bearbeiten, inklusive Positionen |
 
 #### Draft-only-Garantie
 
-- `create_offer` legt immer ein Angebot mit Status 100 (Entwurf) an. Die Angebotsnummer (`AN-…`) holt das Tool selbst aus sevDesk (`SevSequence`). Status, Nummer und Typ können nicht übergeben werden.
+- `create_offer` legt immer ein Angebot mit Status 100 (Entwurf) an. Die Angebotsnummer (`AN-…`) reserviert das Tool selbst über den Angebots-Nummernkreis von sevDesk (`/Order/Factory/getNextOrderNumber`). Status, Nummer und Typ können nicht übergeben werden.
+- Angebotsnummer: Das Tool liest zuerst die nächste Nummer, ohne sie zu reservieren, und prüft, dass kein Auftrag (jeder Status, jeder Kontakt) diese Nummer schon hat. Dann reserviert es die Nummer und prüft noch einmal, falls sevDesk eine andere Nummer liefert. Ist die Nummer vergeben, legt das Tool nichts an und nennt die Nummer und die IDs der vorhandenen Angebote. Abhilfe: in den sevDesk-Einstellungen den Nummernkreis für Angebote über die höchste vergebene AN-Nummer setzen, dann erneut versuchen. Hintergrund: `SevSequence/Factory/getByType` liest den Zähler nur, und `saveOrder` erhöht ihn nicht; frühere Versionen haben deshalb doppelte Nummern erzeugt.
 - `update_offer` liest das Angebot zuerst und lehnt alles ab, was kein Entwurf ist. Status, Nummer und Typ bleiben unverändert. Positionen werden hinzugefügt oder geändert, nie gelöscht.
 - Es gibt keine Tools zum Versenden, zum Ändern des Status, zum Annehmen oder Ablehnen, zum Umwandeln in Rechnung oder Auftragsbestätigung und zum Löschen von Angeboten. Diese Schritte bleiben manuell in sevDesk.
 - `taxRule` und die `taxRate` jeder Position werden vor dem Speichern geprüft:
