@@ -25,14 +25,14 @@ export function zodToJsonSchema(schema: z.ZodType): Record<string, any> {
   return jsonSchema;
 }
 
-export function zodTypeToJsonSchema(zodType: z.ZodType): Record<string, any> {
+export function zodTypeToJsonSchema(zodType: unknown): Record<string, any> {
   // Handle optional, nullable and default wrappers
   if (
     zodType instanceof z.ZodOptional ||
     zodType instanceof z.ZodNullable ||
     zodType instanceof z.ZodDefault
   ) {
-    const inner = zodTypeToJsonSchema(zodType._def.innerType);
+    const inner = zodTypeToJsonSchema(zodType.unwrap());
     if (zodType.description && !inner.description) {
       inner.description = zodType.description;
     }
@@ -74,7 +74,7 @@ export function zodTypeToJsonSchema(zodType: z.ZodType): Record<string, any> {
   if (zodType instanceof z.ZodEnum) {
     const schema: Record<string, any> = {
       type: "string",
-      enum: zodType._def.values,
+      enum: zodType.options,
     };
     if (zodType.description) {
       schema.description = zodType.description;
@@ -85,7 +85,7 @@ export function zodTypeToJsonSchema(zodType: z.ZodType): Record<string, any> {
   if (zodType instanceof z.ZodArray) {
     const schema: Record<string, any> = {
       type: "array",
-      items: zodTypeToJsonSchema(zodType._def.type),
+      items: zodTypeToJsonSchema(zodType.element),
     };
     if (zodType.description) {
       schema.description = zodType.description;
